@@ -12,21 +12,44 @@ import asyncio
 import json
 import tempfile
 import os
+import subprocess
 from app.Config import config
 from app import Redis_client as rc
 from app.Inference import load_model, transcribe
 from app.Worker import process_task
 
 
+def convert_to_wav(input_path: str, output_path: str) -> bool:
+    """Convert any audio format to wav using ffmpeg."""
+    try:
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-ar", "16000", "-ac", "1", "-f", "wav",
+            output_path
+        ], capture_output=True, timeout=30)
+        return result.returncode == 0
+    except Exception as e:
+        print(f"  [LIVE] ffmpeg error: {e}")
+        return False
+
+
 async def process_live_audio(session_id: str, audio_bytes: bytes):
     """Transcribe a live audio chunk and push result back to Redis."""
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            audio_path = os.path.join(tmp_dir, "live_chunk.webm")
-            with open(audio_path, "wb") as f:
+            # Save raw webm bytes
+            webm_path = os.path.join(tmp_dir, "live_chunk.webm")
+            wav_path = os.path.join(tmp_dir, "live_chunk.wav")
+
+            with open(webm_path, "wb") as f:
                 f.write(audio_bytes)
 
-            result = transcribe(audio_path, dialect="auto")
+            # Convert webm -> wav
+            if not convert_to_wav(webm_path, wav_path):
+                print(f"  [LIVE] ffmpeg conversion failed for session {session_id[:16]}")
+                return
+
+            result = transcribe(wav_path, dialect="auto")
             text = result.get("text", "").strip()
 
             if text:
