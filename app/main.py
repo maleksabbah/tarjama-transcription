@@ -17,8 +17,9 @@ from app.Inference import load_model, transcribe
 from app.Worker import process_task
 
 _session_buffers = {}
-MIN_BYTES = 5000        # lowered from 10000
-FLUSH_TIMEOUT = 2.5
+MIN_BYTES = 5000        # minimum bytes accumulated before transcription
+FLUSH_TIMEOUT = 2.5     # flush buffered audio after N seconds of silence
+SESSION_TIMEOUT = 30.0  # declare session ended after N seconds of no chunks
 
 
 def convert_to_wav(input_path: str, output_path: str) -> bool:
@@ -70,7 +71,12 @@ async def live_worker():
             sessions = await rc.get_live_sessions()
             got_chunk = False
 
-            for session_id in sessions:
+            # Track sessions we've seen this cycle to avoid cleaning ones still active
+            active_this_cycle = set(sessions)
+            # Also consider any session with a live buffer as active (key may be empty between chunks)
+            active_this_cycle.update(_session_buffers.keys())
+
+            for session_id in active_this_cycle:
                 chunk = await rc.pop_live_audio(session_id)
                 if chunk:
                     got_chunk = True
@@ -99,7 +105,7 @@ async def live_worker():
                         buf["first_chunk_time"] = now
                         await _transcribe_and_send(session_id, buf["header"], chunks_to_process)
 
-            # Flush stale buffers
+            # Flush stale buffers (user paused but session still open)
             now = time.time()
             for session_id, buf in list(_session_buffers.items()):
                 if buf["chunks"] and now - buf["last_chunk_time"] > FLUSH_TIMEOUT:
@@ -109,11 +115,14 @@ async def live_worker():
                     buf["first_chunk_time"] = now
                     await _transcribe_and_send(session_id, buf["header"], chunks_to_process)
 
-            # Clean up ended sessions
+            # Clean up ended sessions — but only if inactive for SESSION_TIMEOUT
+            # (not just because the Redis list went temporarily empty)
+            now = time.time()
             for session_id in list(_session_buffers.keys()):
-                if session_id not in sessions:
+                buf = _session_buffers[session_id]
+                if now - buf["last_chunk_time"] > SESSION_TIMEOUT:
                     del _session_buffers[session_id]
-                    print(f"  [LIVE] Session {session_id[:16]} ended, cleaned up")
+                    print(f"  [LIVE] Session {session_id[:16]} ended (timeout), cleaned up")
 
             if not got_chunk:
                 await asyncio.sleep(0.05)
