@@ -15,6 +15,37 @@ TORCH_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 _pipe = None
 _processor = None
 
+# Common Whisper training-data hallucinations (YouTube subscribe prompts, music tags)
+HALLUCINATION_MARKERS = [
+    "اشترك",
+    "اشتركوا",
+    "اشتركو",
+    "القناة",
+    "لايك",
+    "لايكات",
+    "شكرا لكم",
+    "شكرا للمشاهدة",
+    "موسيقى",
+    "ترجمة نانسي",
+    "ترجمة نانيك",
+    "subscribe",
+    "like and subscribe",
+    "thanks for watching",
+]
+
+
+def _is_hallucination(text: str) -> bool:
+    """Check if a segment's text matches known Whisper hallucination patterns."""
+    if not text:
+        return False
+    t = text.strip().lower()
+    # Short segments that are entirely a marker
+    if len(t) < 40:
+        for marker in HALLUCINATION_MARKERS:
+            if marker in t:
+                return True
+    return False
+
 
 def load_model():
     """Load the fine-tuned Whisper model as a HuggingFace pipeline with chunking."""
@@ -68,6 +99,7 @@ def transcribe(
         "task": "transcribe",
         "no_repeat_ngram_size": 3,
         "repetition_penalty": 1.2,
+        "condition_on_prev_tokens": False,
     }
 
     # Convert initial_prompt text to token ids that Whisper will use as
@@ -97,6 +129,9 @@ def transcribe(
         ts = c.get("timestamp") or (None, None)
         start = ts[0] if ts[0] is not None else 0.0
         end = ts[1] if ts[1] is not None else start
+        if _is_hallucination(seg_text):
+            print(f"  [INFER] Filtered hallucination: '{seg_text}' @ {start:.2f}s")
+            continue
         segments.append({
             "start": float(start),
             "end": float(end),
