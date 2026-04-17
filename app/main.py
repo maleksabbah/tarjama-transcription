@@ -4,63 +4,50 @@ ASR Transcription Service
 Loads the fine-tuned Whisper model once, then processes:
 1. Batch chunks from queue:transcribe (file upload pipeline)
 2. Live audio chunks from live:audio:{session_id} (real-time pipeline)
+
+Live audio format: raw Int16 PCM @ 16kHz mono (little-endian), sent directly
+from the browser's Web Audio API. No webm, no ffmpeg.
 """
 import asyncio
 import tempfile
 import os
-import subprocess
 import time
 import numpy as np
+import soundfile as sf
 from app.Config import config
 from app import Redis_client as rc
 from app.Inference import load_model, transcribe
 from app.Worker import process_task
 
 _session_buffers = {}
-MIN_BYTES = 5000        # minimum bytes accumulated before transcription
-FLUSH_TIMEOUT = 2.5     # flush buffered audio after N seconds of silence
-SESSION_TIMEOUT = 30.0  # declare session ended after N seconds of no chunks
+MIN_BYTES = 32000       # 16000 Hz * 2 bytes/sample * 1 second = 32000 bytes/sec; ~1s of audio
+FLUSH_TIMEOUT = 2.5
+SESSION_TIMEOUT = 30.0
+SAMPLE_RATE = 16000
 
 
-def convert_to_wav(input_path: str, output_path: str) -> bool:
-    try:
-        result = subprocess.run([
-            "ffmpeg", "-y", "-i", input_path,
-            "-ar", "16000", "-ac", "1", "-f", "wav",
-            output_path
-        ], capture_output=True, timeout=30)
-        if result.returncode != 0:
-            err = result.stderr.decode("utf-8", errors="ignore")[-400:]
-            print(f"  [LIVE] ffmpeg stderr: {err}")
-            try:
-                sz = os.path.getsize(input_path)
-                with open(input_path, "rb") as f:
-                    first = f.read(16).hex()
-                print(f"  [LIVE] input size={sz} bytes, first 16 bytes hex: {first}")
-            except Exception:
-                pass
-        return result.returncode == 0
-    except Exception as e:
-        print(f"  [LIVE] ffmpeg error: {e}")
-        return False
-
-
-async def _transcribe_and_send(session_id: str, header_chunk: bytes, chunks: list):
+async def _transcribe_pcm_and_send(session_id: str, chunks: list):
+    """chunks is a list of bytes where each element is raw Int16 PCM @ 16kHz mono."""
     if not chunks:
         return
     try:
+        # Concatenate and convert Int16 PCM → Float32
+        pcm_bytes = b"".join(chunks)
+        if len(pcm_bytes) < 2:
+            return
+        # Ensure even byte count
+        if len(pcm_bytes) % 2:
+            pcm_bytes = pcm_bytes[:-1]
+        int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
+        audio = int16.astype(np.float32) / 32768.0
+
+        duration = len(audio) / SAMPLE_RATE
+        if duration < 0.3:  # too short to be meaningful
+            return
+
         with tempfile.TemporaryDirectory() as tmp_dir:
-            webm_path = os.path.join(tmp_dir, "chunk.webm")
             wav_path = os.path.join(tmp_dir, "chunk.wav")
-
-            with open(webm_path, "wb") as f:
-                f.write(header_chunk)
-                for c in chunks:
-                    f.write(c)
-
-            if not convert_to_wav(webm_path, wav_path):
-                print(f"  [LIVE] ffmpeg failed for {session_id[:16]}")
-                return
+            sf.write(wav_path, audio, SAMPLE_RATE, subtype="PCM_16")
 
             result = transcribe(wav_path, dialect="auto")
             text = result.get("text", "").strip()
@@ -92,13 +79,12 @@ async def live_worker():
 
                     if session_id not in _session_buffers:
                         _session_buffers[session_id] = {
-                            "header": chunk,
-                            "chunks": [],
-                            "total_bytes": 0,
+                            "chunks": [chunk],
+                            "total_bytes": len(chunk),
                             "first_chunk_time": now,
-                            "last_chunk_time": now
+                            "last_chunk_time": now,
                         }
-                        print(f"  [LIVE] New session {session_id[:16]}, saved header ({len(chunk)} bytes)")
+                        print(f"  [LIVE] New session {session_id[:16]} ({len(chunk)} bytes)")
                         continue
 
                     buf = _session_buffers[session_id]
@@ -110,24 +96,24 @@ async def live_worker():
                         chunks_to_process = buf["chunks"][:]
                         buf["chunks"] = []
                         buf["total_bytes"] = 0
-                        buf["first_chunk_time"] = now
-                        await _transcribe_and_send(session_id, buf["header"], chunks_to_process)
+                        await _transcribe_pcm_and_send(session_id, chunks_to_process)
 
+            # Flush stale buffers (inactivity)
             now = time.time()
             for session_id, buf in list(_session_buffers.items()):
                 if buf["chunks"] and now - buf["last_chunk_time"] > FLUSH_TIMEOUT:
                     chunks_to_process = buf["chunks"][:]
                     buf["chunks"] = []
                     buf["total_bytes"] = 0
-                    buf["first_chunk_time"] = now
-                    await _transcribe_and_send(session_id, buf["header"], chunks_to_process)
+                    await _transcribe_pcm_and_send(session_id, chunks_to_process)
 
+            # Clean up truly ended sessions
             now = time.time()
             for session_id in list(_session_buffers.keys()):
                 buf = _session_buffers[session_id]
                 if now - buf["last_chunk_time"] > SESSION_TIMEOUT:
                     del _session_buffers[session_id]
-                    print(f"  [LIVE] Session {session_id[:16]} ended (timeout), cleaned up")
+                    print(f"  [LIVE] Session {session_id[:16]} ended (timeout)")
 
             if not got_chunk:
                 await asyncio.sleep(0.05)
