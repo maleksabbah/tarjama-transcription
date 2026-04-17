@@ -13,11 +13,12 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
 _pipe = None
+_processor = None
 
 
 def load_model():
     """Load the fine-tuned Whisper model as a HuggingFace pipeline with chunking."""
-    global _pipe
+    global _pipe, _processor
     print(f"Loading model from {MODEL_PATH} on {DEVICE}...")
     start = time.time()
 
@@ -28,13 +29,13 @@ def load_model():
         use_safetensors=True,
     ).to(DEVICE)
 
-    processor = AutoProcessor.from_pretrained(MODEL_PATH)
+    _processor = AutoProcessor.from_pretrained(MODEL_PATH)
 
     _pipe = pipeline(
         "automatic-speech-recognition",
         model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
+        tokenizer=_processor.tokenizer,
+        feature_extractor=_processor.feature_extractor,
         torch_dtype=TORCH_DTYPE,
         device=DEVICE,
         chunk_length_s=30,
@@ -47,8 +48,18 @@ def load_model():
     return _pipe
 
 
-def transcribe(audio_path: str, language: str = "ar", dialect: str = "auto") -> dict:
-    """Transcribe an audio file of arbitrary length with per-segment timestamps."""
+def transcribe(
+    audio_path: str,
+    language: str = "ar",
+    dialect: str = "auto",
+    initial_prompt: str = None,
+) -> dict:
+    """Transcribe an audio file of arbitrary length with per-segment timestamps.
+
+    initial_prompt: optional Arabic text to bias Whisper away from common
+    hallucinations ("subscribe to the channel" etc.) — especially useful
+    for short/silent clips in live mode.
+    """
     if _pipe is None:
         raise RuntimeError("Model not loaded. Call load_model() first.")
 
@@ -58,6 +69,15 @@ def transcribe(audio_path: str, language: str = "ar", dialect: str = "auto") -> 
         "no_repeat_ngram_size": 3,
         "repetition_penalty": 1.2,
     }
+
+    # Convert initial_prompt text to token ids that Whisper will use as
+    # prompt_ids during decoding (bias it toward Arabic/domain speech)
+    if initial_prompt and _processor is not None:
+        try:
+            prompt_ids = _processor.get_prompt_ids(initial_prompt, return_tensors="pt").to(DEVICE)
+            generate_kwargs["prompt_ids"] = prompt_ids
+        except Exception as e:
+            print(f"  [INFER] Could not apply initial_prompt: {e}")
 
     result = _pipe(
         audio_path,

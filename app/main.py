@@ -20,10 +20,28 @@ from app.Inference import load_model, transcribe
 from app.Worker import process_task
 
 _session_buffers = {}
-MIN_BYTES = 32000       # 16000 Hz * 2 bytes/sample * 1 second = 32000 bytes/sec; ~1s of audio
-FLUSH_TIMEOUT = 2.5
-SESSION_TIMEOUT = 30.0
+
+# Audio configuration
 SAMPLE_RATE = 16000
+BYTES_PER_SEC = SAMPLE_RATE * 2  # Int16 PCM mono = 32000 bytes/sec
+
+# Live transcription tuning
+MIN_BYTES = BYTES_PER_SEC * 3      # ~3 seconds — enough context for Whisper to get right
+FLUSH_TIMEOUT = 2.5                # flush partial buffer after user pauses
+SESSION_TIMEOUT = 30.0             # declare session ended after 30 sec of silence
+SILENCE_RMS_THRESHOLD = 0.01       # RMS below this = pure silence, don't transcribe
+MIN_SPEECH_DURATION = 0.5          # ignore clips shorter than 0.5 sec
+
+# Bias Whisper away from YouTube-style hallucinations
+LIVE_INITIAL_PROMPT = "في هذا التسجيل الصوتي، يتحدث المتحدث باللغة العربية."
+
+
+def _audio_is_speech(audio_f32: np.ndarray) -> bool:
+    """Return True only if the audio chunk has non-silent energy."""
+    if audio_f32.size == 0:
+        return False
+    rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
+    return rms >= SILENCE_RMS_THRESHOLD
 
 
 async def _transcribe_pcm_and_send(session_id: str, chunks: list):
@@ -31,26 +49,44 @@ async def _transcribe_pcm_and_send(session_id: str, chunks: list):
     if not chunks:
         return
     try:
-        # Concatenate and convert Int16 PCM → Float32
+        # Concatenate and convert Int16 PCM -> Float32
         pcm_bytes = b"".join(chunks)
         if len(pcm_bytes) < 2:
             return
-        # Ensure even byte count
         if len(pcm_bytes) % 2:
             pcm_bytes = pcm_bytes[:-1]
         int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
         audio = int16.astype(np.float32) / 32768.0
 
         duration = len(audio) / SAMPLE_RATE
-        if duration < 0.3:  # too short to be meaningful
+        if duration < MIN_SPEECH_DURATION:
+            return
+
+        # Silence gate — skip transcription on effectively silent audio
+        if not _audio_is_speech(audio):
+            print(f"  [LIVE] {session_id[:16]}: skipped silent clip ({duration:.1f}s)")
             return
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             wav_path = os.path.join(tmp_dir, "chunk.wav")
             sf.write(wav_path, audio, SAMPLE_RATE, subtype="PCM_16")
 
-            result = transcribe(wav_path, dialect="auto")
-            text = result.get("text", "").strip()
+            result = transcribe(
+                wav_path,
+                dialect="auto",
+                initial_prompt=LIVE_INITIAL_PROMPT,
+            )
+            text = (result.get("text") or "").strip()
+
+            # Reject known hallucination patterns
+            lowered = text.lower()
+            HALLUCINATION_MARKERS = [
+                "اشترك", "اشتركوا", "لايك", "القناة",
+                "subscribe", "like and subscribe",
+            ]
+            if any(m in text or m in lowered for m in HALLUCINATION_MARKERS):
+                print(f"  [LIVE] {session_id[:16]}: suppressed hallucination '{text[:60]}'")
+                return
 
             print(f"  [LIVE] {session_id[:16]}: '{text[:80]}'")
 
@@ -98,7 +134,7 @@ async def live_worker():
                         buf["total_bytes"] = 0
                         await _transcribe_pcm_and_send(session_id, chunks_to_process)
 
-            # Flush stale buffers (inactivity)
+            # Flush stale buffers (user paused)
             now = time.time()
             for session_id, buf in list(_session_buffers.items()):
                 if buf["chunks"] and now - buf["last_chunk_time"] > FLUSH_TIMEOUT:
