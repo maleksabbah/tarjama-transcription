@@ -6,7 +6,6 @@ Loads the fine-tuned Whisper model once, then processes:
 2. Live audio chunks from live:audio:{session_id} (real-time pipeline)
 """
 import asyncio
-import json
 import tempfile
 import os
 import subprocess
@@ -18,9 +17,8 @@ from app.Inference import load_model, transcribe
 from app.Worker import process_task
 
 _session_buffers = {}
-MIN_BYTES = 10000       # ~3 seconds of opus audio
-FLUSH_TIMEOUT = 2.5     # flush if no new chunk for 2.5 seconds
-SILENCE_THRESHOLD = 0.01
+MIN_BYTES = 5000        # lowered from 10000
+FLUSH_TIMEOUT = 2.5
 
 
 def convert_to_wav(input_path: str, output_path: str) -> bool:
@@ -36,28 +34,6 @@ def convert_to_wav(input_path: str, output_path: str) -> bool:
         return False
 
 
-def is_silent(wav_path: str) -> bool:
-    try:
-        import soundfile as sf
-        audio, sr = sf.read(wav_path)
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-        rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
-        return rms < SILENCE_THRESHOLD
-    except Exception:
-        return False
-
-
-HALLUCINATIONS = [
-    "اشتركوا في القناة",
-    "اشترك في القناة",
-    "subscribe",
-    "thank you for watching",
-    "شكراً للمشاهدة",
-    "موسيقى",
-]
-
-
 async def _transcribe_and_send(session_id: str, header_chunk: bytes, chunks: list):
     if not chunks:
         return
@@ -67,7 +43,6 @@ async def _transcribe_and_send(session_id: str, header_chunk: bytes, chunks: lis
             wav_path = os.path.join(tmp_dir, "chunk.wav")
 
             with open(webm_path, "wb") as f:
-                # Always prepend the header chunk so ffmpeg can parse the webm
                 f.write(header_chunk)
                 for c in chunks:
                     f.write(c)
@@ -76,19 +51,12 @@ async def _transcribe_and_send(session_id: str, header_chunk: bytes, chunks: lis
                 print(f"  [LIVE] ffmpeg failed for {session_id[:16]}")
                 return
 
-            if is_silent(wav_path):
-                print(f"  [LIVE] Silent chunk skipped for {session_id[:16]}")
-                return
-
             result = transcribe(wav_path, dialect="auto")
             text = result.get("text", "").strip()
 
-            if any(h.lower() in text.lower() for h in HALLUCINATIONS):
-                print(f"  [LIVE] Hallucination filtered: '{text[:40]}'")
-                return
+            print(f"  [LIVE] {session_id[:16]}: '{text[:80]}'")
 
             if text:
-                print(f"  [LIVE] {session_id[:16]}: '{text[:60]}'")
                 await rc.push_live_result(session_id, {"type": "final", "text": text})
 
     except Exception as e:
@@ -109,7 +77,6 @@ async def live_worker():
                     now = time.time()
 
                     if session_id not in _session_buffers:
-                        # First chunk — save as header, don't add to buffer yet
                         _session_buffers[session_id] = {
                             "header": chunk,
                             "chunks": [],
@@ -125,7 +92,6 @@ async def live_worker():
                     buf["total_bytes"] += len(chunk)
                     buf["last_chunk_time"] = now
 
-                    # Flush when enough data accumulated
                     if buf["total_bytes"] >= MIN_BYTES:
                         chunks_to_process = buf["chunks"][:]
                         buf["chunks"] = []
@@ -133,18 +99,17 @@ async def live_worker():
                         buf["first_chunk_time"] = now
                         await _transcribe_and_send(session_id, buf["header"], chunks_to_process)
 
-            # Flush stale buffers (user paused speaking)
+            # Flush stale buffers
             now = time.time()
             for session_id, buf in list(_session_buffers.items()):
-                if (buf["chunks"] and
-                        now - buf["last_chunk_time"] > FLUSH_TIMEOUT):
+                if buf["chunks"] and now - buf["last_chunk_time"] > FLUSH_TIMEOUT:
                     chunks_to_process = buf["chunks"][:]
                     buf["chunks"] = []
                     buf["total_bytes"] = 0
                     buf["first_chunk_time"] = now
                     await _transcribe_and_send(session_id, buf["header"], chunks_to_process)
 
-            # Clean up sessions that no longer exist in Redis
+            # Clean up ended sessions
             for session_id in list(_session_buffers.keys()):
                 if session_id not in sessions:
                     del _session_buffers[session_id]
