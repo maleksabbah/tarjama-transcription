@@ -58,7 +58,7 @@ HALLUCINATIONS = [
 ]
 
 
-async def _transcribe_and_send(session_id: str, chunks: list):
+async def _transcribe_and_send(session_id: str, header_chunk: bytes, chunks: list):
     if not chunks:
         return
     try:
@@ -67,6 +67,8 @@ async def _transcribe_and_send(session_id: str, chunks: list):
             wav_path = os.path.join(tmp_dir, "chunk.wav")
 
             with open(webm_path, "wb") as f:
+                # Always prepend the header chunk so ffmpeg can parse the webm
+                f.write(header_chunk)
                 for c in chunks:
                     f.write(c)
 
@@ -107,10 +109,16 @@ async def live_worker():
                     now = time.time()
 
                     if session_id not in _session_buffers:
+                        # First chunk — save as header, don't add to buffer yet
                         _session_buffers[session_id] = {
-                            "chunks": [], "total_bytes": 0,
-                            "first_chunk_time": now, "last_chunk_time": now
+                            "header": chunk,
+                            "chunks": [],
+                            "total_bytes": 0,
+                            "first_chunk_time": now,
+                            "last_chunk_time": now
                         }
+                        print(f"  [LIVE] New session {session_id[:16]}, saved header ({len(chunk)} bytes)")
+                        continue
 
                     buf = _session_buffers[session_id]
                     buf["chunks"].append(chunk)
@@ -123,7 +131,7 @@ async def live_worker():
                         buf["chunks"] = []
                         buf["total_bytes"] = 0
                         buf["first_chunk_time"] = now
-                        await _transcribe_and_send(session_id, chunks_to_process)
+                        await _transcribe_and_send(session_id, buf["header"], chunks_to_process)
 
             # Flush stale buffers (user paused speaking)
             now = time.time()
@@ -134,7 +142,13 @@ async def live_worker():
                     buf["chunks"] = []
                     buf["total_bytes"] = 0
                     buf["first_chunk_time"] = now
-                    await _transcribe_and_send(session_id, chunks_to_process)
+                    await _transcribe_and_send(session_id, buf["header"], chunks_to_process)
+
+            # Clean up sessions that no longer exist in Redis
+            for session_id in list(_session_buffers.keys()):
+                if session_id not in sessions:
+                    del _session_buffers[session_id]
+                    print(f"  [LIVE] Session {session_id[:16]} ended, cleaned up")
 
             if not got_chunk:
                 await asyncio.sleep(0.05)
@@ -151,8 +165,7 @@ async def batch_worker():
         try:
             message = await rc.pop_transcribe_task(timeout=5)
             if message:
-                print(f"  [TRANSCRIBE] Received task for job {message.get('job_id')} "
-                      f"chunk {message.get('chunk_index')}")
+                print(f"  [TRANSCRIBE] Received task for job {message.get('job_id')}")
                 await process_task(message)
         except asyncio.CancelledError:
             break
