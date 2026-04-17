@@ -29,6 +29,16 @@ def convert_to_wav(input_path: str, output_path: str) -> bool:
             "-ar", "16000", "-ac", "1", "-f", "wav",
             output_path
         ], capture_output=True, timeout=30)
+        if result.returncode != 0:
+            err = result.stderr.decode("utf-8", errors="ignore")[-400:]
+            print(f"  [LIVE] ffmpeg stderr: {err}")
+            try:
+                sz = os.path.getsize(input_path)
+                with open(input_path, "rb") as f:
+                    first = f.read(16).hex()
+                print(f"  [LIVE] input size={sz} bytes, first 16 bytes hex: {first}")
+            except Exception:
+                pass
         return result.returncode == 0
     except Exception as e:
         print(f"  [LIVE] ffmpeg error: {e}")
@@ -71,9 +81,7 @@ async def live_worker():
             sessions = await rc.get_live_sessions()
             got_chunk = False
 
-            # Track sessions we've seen this cycle to avoid cleaning ones still active
             active_this_cycle = set(sessions)
-            # Also consider any session with a live buffer as active (key may be empty between chunks)
             active_this_cycle.update(_session_buffers.keys())
 
             for session_id in active_this_cycle:
@@ -105,7 +113,6 @@ async def live_worker():
                         buf["first_chunk_time"] = now
                         await _transcribe_and_send(session_id, buf["header"], chunks_to_process)
 
-            # Flush stale buffers (user paused but session still open)
             now = time.time()
             for session_id, buf in list(_session_buffers.items()):
                 if buf["chunks"] and now - buf["last_chunk_time"] > FLUSH_TIMEOUT:
@@ -115,8 +122,6 @@ async def live_worker():
                     buf["first_chunk_time"] = now
                     await _transcribe_and_send(session_id, buf["header"], chunks_to_process)
 
-            # Clean up ended sessions — but only if inactive for SESSION_TIMEOUT
-            # (not just because the Redis list went temporarily empty)
             now = time.time()
             for session_id in list(_session_buffers.keys()):
                 buf = _session_buffers[session_id]
