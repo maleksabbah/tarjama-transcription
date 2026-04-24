@@ -5,7 +5,7 @@ Loads models, starts workers, handles shutdown.
 import asyncio
 from app import Redis_client as rc
 from app.Inference import load_model
-from app.InferenceLive import load_model_live
+from app.Inference import load_model_live
 from app.BatchWorker import batch_worker
 from app.LiveWorker import live_worker
 
