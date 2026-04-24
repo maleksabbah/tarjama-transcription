@@ -8,7 +8,7 @@ import asyncio
 import time
 import numpy as np
 from app import Redis_client as rc
-from app.InferenceLive import transcribe_live
+from app.Inference import transcribe as transcribe_live
 
 SAMPLE_RATE = 16000
 BYTES_PER_SEC = SAMPLE_RATE * 2        # Int16 mono

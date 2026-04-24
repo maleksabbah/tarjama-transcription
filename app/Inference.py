@@ -1,159 +1,101 @@
+"""
+Unified transcription using faster-whisper.
+Handles both batch (full audio file) and live (short numpy buffer).
+Silero VAD built in via vad_filter=True.
+"""
 import os
-import json
-import time
-import torch
-from transformers import (
-    WhisperForConditionalGeneration,
-    AutoProcessor,
-    pipeline,
-)
+import numpy as np
+from faster_whisper import WhisperModel
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "/app/model")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TORCH_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+MODEL_PATH = os.getenv("MODEL_PATH_CT2", "/app/model-ct2")
 
-_pipe = None
-_processor = None
-
-# Common Whisper training-data hallucinations (YouTube subscribe prompts, music tags)
-HALLUCINATION_MARKERS = [
-    "اشترك",
-    "اشتركوا",
-    "اشتركو",
-    "القناة",
-    "لايك",
-    "لايكات",
-    "شكرا لكم",
-    "شكرا للمشاهدة",
-    "موسيقى",
-    "ترجمة نانسي",
-    "ترجمة نانيك",
-    "subscribe",
-    "like and subscribe",
-    "thanks for watching",
-]
+_model: WhisperModel | None = None
 
 
-def _is_hallucination(text: str) -> bool:
-    """Check if a segment's text matches known Whisper hallucination patterns."""
-    if not text:
-        return False
-    t = text.strip().lower()
-    # Short segments that are entirely a marker
-    if len(t) < 40:
-        for marker in HALLUCINATION_MARKERS:
-            if marker in t:
-                return True
-    return False
+def _strip_bom_if_present(path: str) -> None:
+    if not os.path.exists(path):
+        return
+    with open(path, "rb") as f:
+        data = f.read()
+    if data.startswith(b"\xef\xbb\xbf"):
+        with open(path, "wb") as f:
+            f.write(data[3:])
+        print(f"  [INFERENCE] Stripped BOM from {path}")
 
 
 def load_model():
-    """Load the fine-tuned Whisper model as a HuggingFace pipeline with chunking."""
-    global _pipe, _processor
-    print(f"Loading model from {MODEL_PATH} on {DEVICE}...")
-    start = time.time()
-
-    model = WhisperForConditionalGeneration.from_pretrained(
+    global _model
+    if _model is not None:
+        return
+    _strip_bom_if_present(os.path.join(MODEL_PATH, "preprocessor_config.json"))
+    _strip_bom_if_present(os.path.join(MODEL_PATH, "config.json"))
+    print(f"  [INFERENCE] Loading faster-whisper from {MODEL_PATH}...")
+    _model = WhisperModel(
         MODEL_PATH,
-        torch_dtype=TORCH_DTYPE,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-    ).to(DEVICE)
-
-    _processor = AutoProcessor.from_pretrained(MODEL_PATH)
-
-    _pipe = pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=_processor.tokenizer,
-        feature_extractor=_processor.feature_extractor,
-        torch_dtype=TORCH_DTYPE,
-        device=DEVICE,
-        chunk_length_s=30,
-        stride_length_s=(5, 5),
-        return_timestamps=True,
+        device="cuda",
+        compute_type="float16",
     )
-
-    elapsed = time.time() - start
-    print(f"Model loaded in {elapsed:.1f}s on {DEVICE}")
-    return _pipe
+    print("  [INFERENCE] Model loaded.")
 
 
-def transcribe(
-    audio_path: str,
-    language: str = "ar",
-    dialect: str = "auto",
-    initial_prompt: str = None,
-) -> dict:
-    """Transcribe an audio file of arbitrary length with per-segment timestamps.
+# Live convenience alias — same model, same underlying call
+def load_model_live():
+    load_model()
 
-    initial_prompt: optional Arabic text to bias Whisper away from common
-    hallucinations ("subscribe to the channel" etc.) — especially useful
-    for short/silent clips in live mode.
+
+def transcribe(audio, dialect="auto", initial_prompt=None):
     """
-    if _pipe is None:
-        raise RuntimeError("Model not loaded. Call load_model() first.")
+    Accepts either:
+      - str path to a WAV/audio file (batch)
+      - np.ndarray float32 mono 16kHz audio (live)
+    Returns a dict with 'text' and 'segments' for batch,
+    or a plain str of joined text for live.
+    """
+    if _model is None:
+        raise RuntimeError("Model not loaded")
 
-    generate_kwargs = {
-        "language": language,
-        "task": "transcribe",
-        "no_repeat_ngram_size": 3,
-        "repetition_penalty": 1.2,
-        "condition_on_prev_tokens": False,
-    }
-
-    # Convert initial_prompt text to token ids that Whisper will use as
-    # prompt_ids during decoding (bias it toward Arabic/domain speech)
-    if initial_prompt and _processor is not None:
-        try:
-            prompt_ids = _processor.get_prompt_ids(initial_prompt, return_tensors="pt").to(DEVICE)
-            generate_kwargs["prompt_ids"] = prompt_ids
-        except Exception as e:
-            print(f"  [INFER] Could not apply initial_prompt: {e}")
-
-    result = _pipe(
-        audio_path,
-        generate_kwargs=generate_kwargs,
-        return_timestamps=True,
+    segments, info = _model.transcribe(
+        audio,
+        language="ar",
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
+        condition_on_previous_text=False,
+        word_timestamps=True,
+        initial_prompt=initial_prompt,
     )
 
-    text = (result.get("text") or "").strip()
-    chunks = result.get("chunks") or []
-
-    segments = []
-    duration = 0.0
-    for c in chunks:
-        seg_text = (c.get("text") or "").strip()
-        if not seg_text:
+    # Drain generator — faster-whisper returns lazily
+    seg_list = []
+    text_parts = []
+    for seg in segments:
+        t = seg.text.strip()
+        if not t:
             continue
-        ts = c.get("timestamp") or (None, None)
-        start = ts[0] if ts[0] is not None else 0.0
-        end = ts[1] if ts[1] is not None else start
-        if _is_hallucination(seg_text):
-            print(f"  [INFER] Filtered hallucination: '{seg_text}' @ {start:.2f}s")
-            continue
-        segments.append({
-            "start": float(start),
-            "end": float(end),
-            "text": seg_text,
+        seg_list.append({
+            "start": float(seg.start),
+            "end": float(seg.end),
+            "text": t,
         })
-        if end and end > duration:
-            duration = float(end)
+        text_parts.append(t)
 
-    # Fallback: if pipeline returned text but no usable chunks, keep a single segment
-    if not segments and text:
-        segments = [{"start": 0.0, "end": duration or 0.0, "text": text}]
+    full_text = " ".join(text_parts).strip()
 
+    # Live path (numpy in) — return plain string
+    if isinstance(audio, np.ndarray):
+        return full_text
+
+    # Batch path (file path in) — return structured result
     return {
-        "text": text,
-        "segments": segments,
-        "duration_seconds": duration,
-        "confidence": None,
+        "text": full_text,
+        "segments": seg_list,
+        "duration_seconds": float(info.duration),
+        "language": info.language,
     }
 
 
-def save_result(result: dict, path: str) -> str:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+# Used by Worker.py for batch
+def save_result(result: dict, path: str) -> None:
+    import json
     with open(path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
-    return path
