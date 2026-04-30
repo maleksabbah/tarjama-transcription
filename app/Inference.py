@@ -16,8 +16,8 @@ MODEL_PATH = os.getenv("MODEL_PATH_CT2", "/app/model-ct2")
 LLM_CORRECTION_ENABLED = os.getenv("LLM_CORRECTION_ENABLED", "true").lower() == "true"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5")
-LLM_WINDOW_SIZE = int(os.getenv("LLM_WINDOW_SIZE", "15"))   # segments per LLM call
-LLM_WINDOW_OVERLAP = int(os.getenv("LLM_WINDOW_OVERLAP", "2"))  # overlap on both sides
+LLM_WINDOW_SIZE = int(os.getenv("LLM_WINDOW_SIZE", "15"))
+LLM_WINDOW_OVERLAP = int(os.getenv("LLM_WINDOW_OVERLAP", "2"))
 
 _model: WhisperModel | None = None
 
@@ -56,35 +56,52 @@ def load_model_live():
 # LLM post-correction
 # ─────────────────────────────────────────────────────────────────────────────
 
-CORRECTION_SYSTEM_PROMPT = """You are an Arabic ASR transcript corrector specialized in Levantine dialect (Lebanese, Syrian, Palestinian, Jordanian).
+CORRECTION_SYSTEM_PROMPT = """أنت مصحح نصوص ASR متخصص في اللهجة الشامية (لبنان، سوريا، فلسطين، الأردن).
 
-You will receive numbered transcript segments. For EACH segment, return a corrected version.
+ستستلم مقاطع نص مرقمة من تفريغ صوتي. صحح كل مقطع.
 
-RULES:
-1. PRESERVE the Levantine dialect. Do NOT convert to Modern Standard Arabic.
-   - Keep "هلق", "بدي", "شو", "هلكي", "بدها", "إيه", "كيفك" etc. as-is.
-   - Keep "هلق" — do NOT change to "الآن"
-   - Keep "بدي" — do NOT change to "أريد"
-   - Keep "شو" — do NOT change to "ماذا"
-2. Fix obvious spelling errors that change meaning (e.g. "الكرامي" → "الكرامة", "بشدي" → "بشدة").
-3. Fix words that are stuck together OR incorrectly split (e.g. "بسي حة" → "بسيحة").
-4. Add minimal punctuation: periods, commas, question marks where natural.
-5. Do NOT merge or split segments. Each input number gets exactly one output.
-6. Do NOT change segment numbers or timing.
-7. If a segment is already correct, return it unchanged.
-8. If a segment is genuinely garbled and you can't recover meaning, return it unchanged rather than guessing.
-9. Output ONLY a JSON object: {"corrections": [{"id": <int>, "text": "<corrected>"}, ...]}
-   No prose, no explanation, no markdown fences."""
+قواعد إلزامية:
+1. حافظ على اللهجة الشامية. ممنوع التحويل للفصحى.
+   - "هلق" تبقى "هلق" (لا "الآن")
+   - "بدي" تبقى "بدي" (لا "أريد")
+   - "شو" تبقى "شو" (لا "ماذا")
+   - "كيفك" تبقى "كيفك"
+   - "هيك" تبقى "هيك"
+
+2. صحح الأخطاء الإملائية الواضحة، خصوصاً:
+   - الكلمات المقطوعة في غير محلها: "اشيا" → "أشياء"، "بسيحة" تبقى "بسيحة"
+   - الكلمات المدمجة خطأً: "ليقات" → "لي قات"، "هلقوقف" → "هلق وقف"
+   - الهمزات الناقصة: "اسمعت" → "أسمعت"، "اني" → "إني"
+   - أخطاء التعرف الصوتي الشائعة:
+     • "الكرامي" → "الكرامة"
+     • "اغساك" → "أقسى"
+     • "بشدي" → "بشدة"
+     • "نقاد" → "نقاط"
+     • "اني عالى" → "أنا علي"
+     • "اهرا وسهلك" → "أهلاً وسهلاً"
+     • "اشكال الوان" → "أشكال ألوان"
+     • "زلمنا" → "زلمنا" (تبقى)
+     • "مسخني" → "مش هني" أو حسب السياق
+
+3. أضف علامات ترقيم بسيطة (نقطة، فاصلة، علامة استفهام) عند اللزوم.
+
+4. لا تدمج المقاطع ولا تقسمها. كل رقم input له output واحد بنفس الرقم.
+
+5. إذا المقطع مفهوم وصحيح، أعده كما هو.
+
+6. إذا المقطع مدمر تماماً ولا يمكن استرداد المعنى، أعده كما هو بدون تخمين.
+
+7. أرجع JSON فقط، بدون أي شرح أو نص إضافي:
+{"corrections": [{"id": <int>, "text": "<corrected>"}, ...]}
+
+لا تكتب markdown fences. لا تشرح. JSON فقط."""
 
 
 async def _call_claude(segments_window: list[dict]) -> dict[int, str]:
-    """
-    Send a window of segments to Claude, return {seg_id: corrected_text}.
-    """
     if not ANTHROPIC_API_KEY:
         return {}
 
-    user_content = "Correct these Levantine Arabic transcript segments:\n\n"
+    user_content = "صحح هذه المقاطع من تفريغ صوتي بالعامية الشامية:\n\n"
     for seg in segments_window:
         user_content += f"{seg['id']}. {seg['text']}\n"
 
@@ -110,7 +127,6 @@ async def _call_claude(segments_window: list[dict]) -> dict[int, str]:
             resp.raise_for_status()
             data = resp.json()
         text = data["content"][0]["text"].strip()
-        # Strip markdown fences if model adds them despite the prompt
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0]
         parsed = json.loads(text)
@@ -121,16 +137,11 @@ async def _call_claude(segments_window: list[dict]) -> dict[int, str]:
 
 
 async def _correct_with_llm(segments: list[dict]) -> list[dict]:
-    """
-    Run sliding-window LLM correction over all segments.
-    Returns a new segments list with text replaced where the LLM responded.
-    """
     if not segments or not ANTHROPIC_API_KEY:
         return segments
 
     print(f"  [LLM] Correcting {len(segments)} segments with {LLM_MODEL}...")
 
-    # Assign stable ids
     indexed = [{"id": i, "text": s["text"], "start": s["start"], "end": s["end"]}
                for i, s in enumerate(segments)]
 
@@ -140,7 +151,6 @@ async def _correct_with_llm(segments: list[dict]) -> list[dict]:
     while i < len(indexed):
         window = indexed[i : i + LLM_WINDOW_SIZE]
         result = await _call_claude(window)
-        # Only overwrite when not already set (so center segments win over edges)
         for seg_id, txt in result.items():
             if seg_id not in corrected_text:
                 corrected_text[seg_id] = txt
@@ -160,8 +170,6 @@ async def _correct_with_llm(segments: list[dict]) -> list[dict]:
 # Transcription
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Levantine drama-domain prompt — biases the decoder toward dialect spellings
-# and away from MSA. Keep it short; long prompts hurt accuracy.
 LEVANTINE_PROMPT = (
     "حوار باللهجة العامية الشامية. هلق، بدي، شو، كيفك، هلكي، إيه، لك، يلا، هيك."
 )
@@ -172,20 +180,12 @@ async def transcribe(audio, dialect="auto", initial_prompt=None, apply_llm_corre
     Accepts either:
       - str path to a WAV/audio file (batch)
       - np.ndarray float32 mono 16kHz audio (live)
-    Returns a dict with 'text' and 'segments' for batch,
-    or a plain str of joined text for live.
-
-    apply_llm_correction:
-      - None  -> use LLM_CORRECTION_ENABLED env default (batch only)
-      - True  -> force on  (batch only; ignored for live)
-      - False -> force off
+    Returns dict for batch, plain str for live.
     """
     if _model is None:
         raise RuntimeError("Model not loaded")
 
     is_live = isinstance(audio, np.ndarray)
-
-    # Pick a sensible default prompt for Levantine if caller didn't supply one
     prompt = initial_prompt if initial_prompt is not None else LEVANTINE_PROMPT
 
     segments, info = _model.transcribe(
@@ -194,14 +194,14 @@ async def transcribe(audio, dialect="auto", initial_prompt=None, apply_llm_corre
         beam_size=5,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
-        # ── anti-repetition / anti-loop / anti-hallucination tuning ──
-        condition_on_previous_text=False,        # kills chorus loops
-        no_repeat_ngram_size=3,                  # no exact 3-gram repeats per segment
-        repetition_penalty=1.4,                  # discourage repeated tokens
-        compression_ratio_threshold=2.2,         # tighter; flags repetitive output
-        log_prob_threshold=-1.0,                 # discard low-confidence segments
-        no_speech_threshold=0.6,                 # require clearer speech to emit
-        temperature=[0.0, 0.2, 0.4, 0.6, 0.8],   # fallback ladder on failures
+        # ── conservative anti-loop tuning ──
+        condition_on_previous_text=False,        # KEY fix: stops chorus loops
+        no_repeat_ngram_size=3,
+        repetition_penalty=1.15,                 # gentle, not aggressive
+        compression_ratio_threshold=2.4,         # whisper default
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
+        temperature=[0.0, 0.2, 0.4, 0.6, 0.8],   # fallback ladder
         word_timestamps=True,
         initial_prompt=prompt,
     )
@@ -219,11 +219,9 @@ async def transcribe(audio, dialect="auto", initial_prompt=None, apply_llm_corre
         })
         text_parts.append(t)
 
-    # Live path — no LLM correction (latency), no structured output
     if is_live:
         return " ".join(text_parts).strip()
 
-    # Batch path — optional LLM correction
     do_correction = (
         LLM_CORRECTION_ENABLED if apply_llm_correction is None else apply_llm_correction
     )
