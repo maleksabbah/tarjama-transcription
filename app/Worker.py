@@ -30,7 +30,7 @@ async def process_task(message: dict):
 
             # Step 2: Run Whisper pipeline on full audio
             print(f"  [TRANSCRIBE] Running Whisper inference...")
-            result = transcribe(local_audio, dialect=dialect)
+            result = await transcribe(local_audio, dialect=dialect)
 
             # Step 3: Save result and upload to S3
             local_result = os.path.join(tmp_dir, "transcript.json")

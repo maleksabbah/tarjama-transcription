@@ -41,7 +41,7 @@ async def _transcribe_and_send(session_id: str, chunks: list[bytes]):
         if duration < MIN_SPEECH_DURATION:
             return
 
-        text = transcribe_live(audio)
+        text = await transcribe_live(audio)
 
         if not text:
             # VAD found no speech — skip silently
