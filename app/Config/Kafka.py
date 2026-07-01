@@ -29,7 +29,6 @@ async def close_producer() -> None:
         await _producer.stop()
         _producer = None
 
-
 def make_consumer(
     topics: list[str],
     group_id: str,
@@ -42,4 +41,7 @@ def make_consumer(
         auto_offset_reset=auto_offset_reset,
         enable_auto_commit=False,
         value_deserializer=lambda v: v.decode("utf-8"),
+        max_poll_interval_ms=900000,
+        session_timeout_ms=60000,
+        heartbeat_interval_ms=10000,
     )
